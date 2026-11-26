@@ -1,0 +1,102 @@
+name: CodeQL
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze (${{ matrix.language }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        language: [python, javascript-typescript]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: github/codeql-action/init@v3
+        with:
+          languages: ${{ matrix.language }}
+          queries: security-extended
+      - uses: github/codeql-action/analyze@v3
+        with:
+          category: "/language:${{ matrix.language }}"
+          output: sarif-results
+
+      # Kirim ringkasan temuan CodeQL ke webhook (URL disimpan di secret WEBHOOK_URL)
+      - name: Kirim hasil ke webhook
+        env:
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          LANGUAGE: ${{ matrix.language }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          if [ -z "${WEBHOOK_URL:-}" ]; then
+            echo "::warning::Secret WEBHOOK_URL belum di-set, skip kirim webhook"
+            exit 0
+          fi
+
+          jq -s \
+            --arg repo "$GITHUB_REPOSITORY" \
+            --arg commit "$GITHUB_SHA" \
+            --arg branch "$GITHUB_REF_NAME" \
+            --arg language "$LANGUAGE" \
+            --arg run_url "$RUN_URL" \
+            --arg server "$GITHUB_SERVER_URL" '
+            def sev($s):
+              if $s == null then "unknown"
+              else ($s | tonumber) as $n
+                | if $n >= 9 then "critical" elif $n >= 7 then "high"
+                  elif $n >= 4 then "medium" else "low" end
+              end;
+            [ .[].runs[]
+              | ([.tool.driver.rules[]?, .tool.extensions[]?.rules[]?]
+                 | map({key: .id, value: .}) | from_entries) as $rules
+              | .results[]
+              | . as $r
+              | ($r.ruleId // $r.rule.id) as $id
+              | ($rules[$id] // {}) as $rule
+              | ($r.locations[0].physicalLocation) as $loc
+              | {
+                  rule_id: $id,
+                  title: ($rule.shortDescription.text // $id),
+                  severity: sev($rule.properties["security-severity"]),
+                  security_severity_score: $rule.properties["security-severity"],
+                  message: $r.message.text,
+                  description: $rule.fullDescription.text,
+                  cwe: [($rule.properties.tags // [])[] | select(startswith("external/cwe/"))
+                        | sub("external/cwe/"; "") | ascii_upcase],
+                  file: $loc.artifactLocation.uri,
+                  start_line: $loc.region.startLine,
+                  end_line: ($loc.region.endLine // $loc.region.startLine),
+                  link: "\($server)/\($repo)/blob/\($commit)/\($loc.artifactLocation.uri)#L\($loc.region.startLine)"
+                }
+            ] as $findings
+            | {
+                event: "code_scanning_result",
+                repository: $repo,
+                branch: $branch,
+                commit: $commit,
+                language: $language,
+                run_url: $run_url,
+                total_findings: ($findings | length),
+                by_severity: ($findings | group_by(.severity) | map({key: .[0].severity, value: length}) | from_entries),
+                findings: $findings
+              }' sarif-results/*.sarif > payload.json
+
+          echo "Total temuan: $(jq .total_findings payload.json)"
+
+          if ! curl -sS --fail-with-body -X POST "$WEBHOOK_URL" \
+              -H "Content-Type: application/json" \
+              --data @payload.json; then
+            echo "::error::Gagal kirim payload ke webhook"
+            exit 1
+          fi
